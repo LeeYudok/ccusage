@@ -7,8 +7,8 @@ use std::{
 use serde_json::{Map, Value};
 
 use ccusage_cli::{
-    BlocksArgs, CodexSpeed, CostMode, CostSource, DailyArgs, NamedPiStore, PricingOverride,
-    SharedArgs, SortOrder, StatuslineArgs, VisualBurnRate, WeekDay, WeeklyArgs,
+    BlocksArgs, CodexSpeed, CostMode, CostSource, DATE_BOUND_FORMATS, DailyArgs, NamedPiStore,
+    PricingOverride, SharedArgs, SortOrder, StatuslineArgs, VisualBurnRate, WeekDay, WeeklyArgs,
     normalize_date_bound,
 };
 
@@ -42,12 +42,35 @@ impl ConfigContext {
             .transpose()
             .map(|stores| (stores.unwrap_or_default(), None))
             .unwrap_or_else(|error| (Vec::new(), Some(error)));
-        Self {
+        let mut context = Self {
             value,
             command,
             pi_stores,
             error,
+        };
+        if context.error.is_none() {
+            context.error = context.date_bound_error();
         }
+        context
+    }
+
+    /// Config bounds bypass the CLI parser, so they need the same rejection the
+    /// parser gives `--since` / `--until`. `apply_shared_options` cannot fail,
+    /// so the check runs here and surfaces through `config_error`.
+    fn date_bound_error(&self) -> Option<String> {
+        self.option_maps().into_iter().find_map(|options| {
+            let options = SharedOptions::from_map(options);
+            [("since", options.since), ("until", options.until)]
+                .into_iter()
+                .find_map(|(key, value)| {
+                    let value = value?;
+                    normalize_date_bound(&value).is_none().then(|| {
+                        config_error(format!(
+                            "{key} '{value}' is not a valid date. Expected {DATE_BOUND_FORMATS}"
+                        ))
+                    })
+                })
+        })
     }
 
     fn option_maps(&self) -> Vec<&Map<String, Value>> {
@@ -522,11 +545,13 @@ impl ccusage_cli::CliConfig for ConfigContext {
 }
 
 fn apply_shared_options(shared: &mut SharedArgs, options: SharedOptions) {
-    if let Some(since) = options.since {
-        shared.since = Some(normalize_date_bound(&since));
+    // Invalid bounds are rejected in `ConfigContext::date_bound_error`, so an
+    // unnormalizable value here is left for that error to report.
+    if let Some(since) = options.since.as_deref().and_then(normalize_date_bound) {
+        shared.since = Some(since);
     }
-    if let Some(until) = options.until {
-        shared.until = Some(normalize_date_bound(&until));
+    if let Some(until) = options.until.as_deref().and_then(normalize_date_bound) {
+        shared.until = Some(until);
     }
     if let Some(json) = options.json {
         shared.json = json;
@@ -1143,6 +1168,41 @@ mod tests {
         assert!(validate_named_pi_store_name("Omp").is_err());
         assert!(validate_named_pi_store_name("all").is_err());
         assert!(validate_named_pi_store_name("codex").is_err());
+    }
+
+    #[test]
+    fn rejects_config_date_bounds_that_are_not_real_calendar_dates() {
+        let config = config_context_from_json(r#"{ "defaults": { "since": "2026-02-30" } }"#);
+
+        assert_eq!(
+            config.config_error(),
+            Some(
+                "Invalid ccusage config: since '2026-02-30' is not a valid date. Expected YYYY-MM-DD or YYYYMMDD"
+            )
+        );
+
+        let config = config_context_from_json(r#"{ "commands": { "daily": { "until": "abc" } } }"#);
+
+        assert_eq!(
+            config.config_error(),
+            Some(
+                "Invalid ccusage config: until 'abc' is not a valid date. Expected YYYY-MM-DD or YYYYMMDD"
+            )
+        );
+    }
+
+    #[test]
+    fn normalizes_valid_config_date_bounds() {
+        let config = config_context_from_json(
+            r#"{ "defaults": { "since": "2026-01-01", "until": "20260131" } }"#,
+        );
+        let mut shared = SharedArgs::default();
+
+        assert_eq!(config.config_error(), None);
+        apply_config_to_shared(&mut shared, &config);
+
+        assert_eq!(shared.since.as_deref(), Some("20260101"));
+        assert_eq!(shared.until.as_deref(), Some("20260131"));
     }
 
     fn context(value: Value, raw: &str, agent: Option<&str>, report: &str) -> ConfigContext {
