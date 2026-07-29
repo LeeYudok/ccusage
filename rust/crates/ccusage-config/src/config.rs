@@ -29,14 +29,15 @@ pub struct ConfigContext {
     value: Option<Value>,
     command: ConfigCommand,
     pi_stores: Vec<NamedPiStore>,
-    error: Option<String>,
+    pi_store_error: Option<String>,
+    date_bound_error: Option<String>,
 }
 
 impl ConfigContext {
     pub fn from_args(args: &[String]) -> Self {
         let command = detect_config_command(args);
         let value = load_config_value(scan_config_path(args).as_deref());
-        let (pi_stores, error) = value
+        let (pi_stores, pi_store_error) = value
             .as_ref()
             .map(parse_named_pi_stores)
             .transpose()
@@ -46,18 +47,26 @@ impl ConfigContext {
             value,
             command,
             pi_stores,
-            error,
+            pi_store_error,
+            date_bound_error: None,
         };
-        if context.error.is_none() {
-            context.error = context.date_bound_error();
-        }
+        context.date_bound_error = context.detect_date_bound_error();
         context
+    }
+
+    /// Named pi stores only reach commands that read them, so their parse error
+    /// stays gated on those commands.
+    fn active_pi_store_error(&self) -> Option<&str> {
+        self.command_uses_named_pi_stores()
+            .then_some(self.pi_store_error.as_deref())
+            .flatten()
     }
 
     /// Config bounds bypass the CLI parser, so they need the same rejection the
     /// parser gives `--since` / `--until`. `apply_shared_options` cannot fail,
-    /// so the check runs here and surfaces through `config_error`.
-    fn date_bound_error(&self) -> Option<String> {
+    /// so the check runs here and surfaces through `config_error` for every
+    /// command that applies shared options, not just the pi-store readers.
+    fn detect_date_bound_error(&self) -> Option<String> {
         self.option_maps().into_iter().find_map(|options| {
             let options = SharedOptions::from_map(options);
             [("since", options.since), ("until", options.until)]
@@ -389,7 +398,7 @@ fn apply_config_to_shared(shared: &mut SharedArgs, config: &ConfigContext) {
     for options in config.option_maps() {
         apply_shared_options(shared, SharedOptions::from_map(options));
     }
-    if config.error.is_none() {
+    if config.pi_store_error.is_none() {
         shared.pi_stores = config.pi_stores.clone();
     }
 }
@@ -509,9 +518,8 @@ fn apply_config_to_agent_args(
 
 impl ccusage_cli::CliConfig for ConfigContext {
     fn config_error(&self) -> Option<&str> {
-        self.command_uses_named_pi_stores()
-            .then_some(self.error.as_deref())
-            .flatten()
+        self.active_pi_store_error()
+            .or(self.date_bound_error.as_deref())
     }
 
     fn apply_shared(&self, shared: &mut SharedArgs) {
@@ -545,7 +553,7 @@ impl ccusage_cli::CliConfig for ConfigContext {
 }
 
 fn apply_shared_options(shared: &mut SharedArgs, options: SharedOptions) {
-    // Invalid bounds are rejected in `ConfigContext::date_bound_error`, so an
+    // Invalid bounds are rejected in `ConfigContext::detect_date_bound_error`, so an
     // unnormalizable value here is left for that error to report.
     if let Some(since) = options.since.as_deref().and_then(normalize_date_bound) {
         shared.since = Some(since);
@@ -1192,6 +1200,45 @@ mod tests {
     }
 
     #[test]
+    fn rejects_config_date_bounds_for_commands_without_named_pi_stores() {
+        for command in [
+            vec!["blocks"],
+            vec!["statusline"],
+            vec!["all", "daily"],
+            vec!["codex", "daily"],
+        ] {
+            let config = config_context_for_command(
+                r#"{ "defaults": { "since": "2026-02-30" } }"#,
+                &command,
+            );
+
+            assert_eq!(
+                config.config_error(),
+                Some(
+                    "Invalid ccusage config: since '2026-02-30' is not a valid date. Expected YYYY-MM-DD or YYYYMMDD"
+                ),
+                "expected {command:?} to reject the invalid config date bound"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_named_pi_store_errors_gated_to_commands_that_read_them() {
+        let raw = r#"{ "pi": { "stores": [{ "name": "omp" }] } }"#;
+
+        assert_eq!(
+            config_context_for_command(raw, &["daily"]).config_error(),
+            Some(
+                "Invalid ccusage config: pi.stores[0] must contain string fields 'name' and 'path'"
+            )
+        );
+        assert_eq!(
+            config_context_for_command(raw, &["blocks"]).config_error(),
+            None
+        );
+    }
+
+    #[test]
     fn normalizes_valid_config_date_bounds() {
         let config = config_context_from_json(
             r#"{ "defaults": { "since": "2026-01-01", "until": "20260131" } }"#,
@@ -1214,18 +1261,25 @@ mod tests {
                 report: report.to_string(),
             },
             pi_stores: Vec::new(),
-            error: None,
+            pi_store_error: None,
+            date_bound_error: None,
         }
     }
 
     fn config_context_from_json(raw: &str) -> ConfigContext {
+        config_context_for_command(raw, &["daily"])
+    }
+
+    fn config_context_for_command(raw: &str, command: &[&str]) -> ConfigContext {
         let fixture = fs_fixture!({
             "ccusage.json": raw,
         });
-        ConfigContext::from_args(&[
-            "daily".to_string(),
-            "--config".to_string(),
-            fixture.path("ccusage.json").to_string_lossy().into_owned(),
-        ])
+        let mut args = command
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>();
+        args.push("--config".to_string());
+        args.push(fixture.path("ccusage.json").to_string_lossy().into_owned());
+        ConfigContext::from_args(&args)
     }
 }
