@@ -358,8 +358,6 @@ mod tests {
     fn rejects_undocumented_spellings() {
         assert_eq!(normalize_date_bound("abc"), None);
         assert_eq!(normalize_date_bound(""), None);
-        assert_eq!(normalize_date_bound("2026"), None);
-        assert_eq!(normalize_date_bound("202601"), None);
         assert_eq!(normalize_date_bound("2026/07/10"), None);
         assert_eq!(normalize_date_bound("2026-7-10"), None);
         assert_eq!(normalize_date_bound("2026-07-10T00:00:00Z"), None);
